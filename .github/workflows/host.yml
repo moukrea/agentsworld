@@ -199,7 +199,9 @@ jobs:
           if ($LASTEXITCODE) { throw "update failed ($LASTEXITCODE)" }
           Invoke-WebRequest -UseBasicParsing http://127.0.0.1:14317/api/health | Out-Null
           & $cli uninstall --purge
-          Start-Sleep -Seconds 3
+          if ($LASTEXITCODE) { throw "uninstall failed ($LASTEXITCODE)" }
+          Start-Sleep -Seconds 6
+          if (Test-Path (Split-Path $cli)) { throw 'the command folder is still there' }
           $still = $true; try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:14317/api/health -TimeoutSec 3 | Out-Null } catch { $still = $false }
           if ($still) { throw 'the host still answers after uninstall' }
           if (Get-ScheduledTask -TaskName 'AgentsWorld host' -ErrorAction SilentlyContinue) { throw 'the scheduled task is still there' }

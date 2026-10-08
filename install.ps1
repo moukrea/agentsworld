@@ -461,7 +461,8 @@ switch ($Command) {
     $bin = Join-Path $Prefix 'bin'
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     [Environment]::SetEnvironmentVariable('Path', (($userPath -split ';') | Where-Object { $_ -and $_ -ne $bin }) -join ';', 'User')
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bin
+    # agentsworld.cmd is still being read by cmd.exe: its folder goes a few seconds after this command returns.
+    Start-Process -FilePath cmd.exe -ArgumentList "/d /c ping -n 4 127.0.0.1 >nul & rmdir /s /q `"$bin`" & rmdir `"$Prefix`"" -WindowStyle Hidden
     Write-Host "AgentsWorld desinstalle.$(if (-not $purge) { " Le monde et les appairages sont gardes dans $($R.hostData) (--purge les supprime)." })"
   }
   { $_ -in 'version', '--version' } { Write-Host $R.version }
@@ -482,9 +483,7 @@ switch ($Command) {
 }
 '@
   WriteUtf8 (Join-Path $Bin 'agentsworld.ps1') $cli
-  # One line ending with `exit /b`: cmd parses the whole line first, so `agentsworld uninstall`, which deletes this
-  # file, does not leave cmd looking for a next line in it (exit /b keeps PowerShell's exit code).
-  WriteUtf8 (Join-Path $Bin 'agentsworld.cmd') "@powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0agentsworld.ps1`" %* & exit /b`r`n"
+  WriteUtf8 (Join-Path $Bin 'agentsworld.cmd') "@powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0agentsworld.ps1`" %*`r`n"
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (($userPath -split ';') -notcontains $Bin) { [Environment]::SetEnvironmentVariable('Path', (@($userPath, $Bin) | Where-Object { $_ }) -join ';', 'User') }
   $env:Path = "$Bin;$env:Path"
