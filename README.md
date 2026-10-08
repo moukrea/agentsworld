@@ -72,6 +72,17 @@ agentsworld uninstall [--purge]    # désinstalle (--purge : aussi le monde et l
 
 `--client-only` ne désinstalle jamais un hôte déjà là ; `agentsworld role remove host` le fait.
 
+### Mises à jour automatiques
+
+Tout se met à jour seul, comme Jaunt. L'**hôte sans écran** et l'**agent** regardent toutes les 15 minutes la version
+publiée ; une nouvelle version s'installe d'elle-même (jamais pendant un enregistrement vocal ni pendant l'envoi d'une
+réponse), vérifiée avec `SHA256SUMS`, puis le service redémarre en sauvegardant le monde. Si la nouvelle version ne
+répond pas, l'ancienne reprend aussitôt et l'échec s'affiche dans le panneau Sources et dans `agentsworld status`.
+L'**application de bureau** propose « Mettre à jour maintenant » ou « Ignorer » au lancement puis régulièrement (une
+installation `.deb`/`.rpm` indique la commande à lancer) ; l'**application Android** aussi, au plus toutes les 6 heures,
+puis passe par l'installateur d'Android. Une page du jeu ouverte sur un hôte mis à jour propose de se recharger.
+`agentsworld update --auto off` coupe les mises à jour automatiques de l'hôte et de l'agent.
+
 ## Télécharger à la main
 
 Tout est sur la page [Releases](https://github.com/moukrea/agentsworld/releases/latest), avec `SHA256SUMS` pour

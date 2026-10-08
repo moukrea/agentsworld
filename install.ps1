@@ -15,7 +15,7 @@ param(
   [switch]$App, [switch]$ClientOnly, [Alias('Host')][switch]$HostRole, [switch]$Agent,
   [string]$Hub = '', [string]$Token = '', [string]$Name = '',
   [int]$Port = 0, [int]$LinkPort = 0, [string]$Relay = '', [string]$Bind = '', [string]$Version = '',
-  [switch]$NoService, [switch]$NoPair, [switch]$Yes
+  [switch]$NoService, [switch]$NoPair, [switch]$Yes, [switch]$OnlyServices
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -49,6 +49,18 @@ $AgentEnv = Join-Path $Prefix 'agent.env'
 $Runtime = Join-Path $Prefix 'runtime'
 $Rt = Join-Path $Runtime 'current'
 $Tasks = @{ host = 'AgentsWorld host'; agent = 'AgentsWorld agent' }
+# The update status the host reports (server/self-update.mjs): written once the roles include the host or the agent.
+$script:Track = $false
+$script:CurrentVersion = ''
+$script:Tag = ''
+function UStatus($state, $message, $version) {
+  if (-not $script:Track) { return }
+  if (-not $version) { $version = $script:CurrentVersion }
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  $status = [ordered]@{ state = $state; target = $script:Tag; version = $version; at = $now; message = [string]$message }
+  if ($state -eq 'error') { $status.failed = [ordered]@{ tag = $script:Tag; at = $now; reason = [string]$message } }
+  try { WriteUtf8 (Join-Path $Prefix 'update-status.json') ($status | ConvertTo-Json -Compress) } catch { }
+}
 if ($Repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { Fail 'Nom de depot invalide.' }
 New-Item -ItemType Directory -Force -Path $Prefix, $Bin | Out-Null
 $Tmp = Join-Path $Prefix (".install." + [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -70,7 +82,13 @@ try {
   $JauntDir = Join-Path $Local 'jaunt'
   $Jaunt = [bool](Get-Command jaunt -ErrorAction SilentlyContinue) -or (Test-Path $JauntDir)
   $Interactive = [Environment]::UserInteractive -and -not $Yes -and -not ([Environment]::GetCommandLineArgs() -match '^-NonInteractive$')
-  if ($chosen.Count -eq 1) { $Roles = $chosen }
+  if ($OnlyServices) {
+    # The automatic update: the host and the agent only (the desktop app updates itself).
+    $Yes = $true
+    $Roles = @($Installed | Where-Object { $_ -eq 'host' -or $_ -eq 'agent' })
+    if (-not $Roles.Count) { Info 'Ni hote ni agent installe : rien a mettre a jour.'; return }
+  }
+  elseif ($chosen.Count -eq 1) { $Roles = $chosen }
   elseif ($Installed.Count -and -not $Interactive) { $Roles = $Installed }
   elseif ($Interactive) {
     $recommended = if ($Installed.Count) { '0' } else { '1' }
@@ -136,6 +154,11 @@ try {
   $Tag = if ($Want.StartsWith('v')) { $Want } else { "v$Want" }
   if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { Fail "Version invalide : $Tag" }
   $V = $Tag.Substring(1)
+  $script:Tag = $Tag
+  $versionFile = Join-Path $Rt 'VERSION'
+  if (Test-Path $versionFile) { $script:CurrentVersion = (Get-Content $versionFile -Raw).Trim() }
+  $script:Track = [bool]($Roles | Where-Object { $_ -eq 'host' -or $_ -eq 'agent' })
+  UStatus 'downloading' "Telechargement de $Tag"
   $Base = (Setting 'AGENTSWORLD_RELEASE_BASE' "https://github.com/$Repo/releases/download/$Tag").TrimEnd('/')
   Say "Version $Tag ($($Roles -join ' '))"
   Fetch "$Base/SHA256SUMS" (Join-Path $Tmp 'SHA256SUMS')
@@ -168,6 +191,7 @@ try {
     if ((Test-Path $current) -and ((Get-Content $current -Raw).Trim() -eq $V) -and (Setting 'AGENTSWORLD_REINSTALL' '0') -ne '1') {
       Info "Moteur $V deja en place."; return
     }
+    UStatus 'installing' "Installation de $Tag"
     $zip = Asset "agentsworld-host_${V}_windows-x64.zip"
     $target = Join-Path $Runtime ("versions\$Tag-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + "-$PID")
     New-Item -ItemType Directory -Force -Path $target | Out-Null
@@ -177,11 +201,13 @@ try {
       Remove-Item -Recurse -Force $target; Fail 'Le moteur ne demarre pas sur ce systeme.'
     }
     foreach ($role in 'host', 'agent') { if ($Installed -contains $role) { Stop-Role $role } }
-    if (Test-Path $Rt) { cmd /c rmdir "$Rt" | Out-Null }
-    New-Item -ItemType Junction -Path $Rt -Target $target | Out-Null
-    # Keep the current runtime and one previous one.
-    Get-ChildItem (Join-Path $Runtime 'versions') -Directory | Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 |
-      Where-Object { $_.FullName -ne $target } | ForEach-Object { Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
+    # The runtime that ran until now, for a rollback (Install-Host / Install-Agent switch back if the new one fails).
+    if (Test-Path $Rt) { $script:PrevRt = [string]((Get-Item $Rt -Force).Target | Select-Object -First 1) }
+    Switch-Runtime $target
+    # Keep the new runtime and the one that ran until now (a rollback); the others go (one still in use stays).
+    $keep = @((Get-Item $target).FullName); if ($script:PrevRt) { $keep += (Get-Item $script:PrevRt -ErrorAction SilentlyContinue).FullName }
+    Get-ChildItem (Join-Path $Runtime 'versions') -Directory | Where-Object { $keep -notcontains $_.FullName } |
+      ForEach-Object { Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
     Info "Moteur $V installe (Node $nodeVersion)."
   }
   # The script a role's scheduled task runs, hidden: Node with its output appended to <prefix>\<role>.log.
@@ -230,11 +256,34 @@ exit `$p.ExitCode
     $script:Service = 'none'
     Info 'Demarre en arriere-plan (pas de tache planifiee : a relancer apres un redemarrage avec agentsworld start).'
   }
-  function Wait-Host($port) {
-    for ($i = 0; $i -lt 60; $i++) {
-      try { Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 2 | Out-Null; return $true } catch { Start-Sleep -Seconds 1 }
+  $script:PrevRt = ''
+  function Switch-Runtime($target) {
+    if (Test-Path $Rt) { cmd /c rmdir "$Rt" | Out-Null }
+    New-Item -ItemType Junction -Path $Rt -Target $target | Out-Null
+  }
+  # The host answers /api/health with protocol 3 and, when given, this version.
+  function Wait-Host($port, $version = '', $seconds = 60) {
+    for ($i = 0; $i -lt $seconds; $i++) {
+      try {
+        $h = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 2
+        if ($h.protocol -eq 3 -and (-not $version -or $h.version -eq $version)) { return $true }
+      } catch { }
+      Start-Sleep -Seconds 1
     }
     return $false
+  }
+  # The new runtime does not serve: back to the previous one, restarted, and the update reported as failed.
+  function Rollback($role, $reason) {
+    $prev = $script:PrevRt
+    if (-not $prev -or -not (Test-Path (Join-Path $prev 'bin\node.exe'))) { Fail $reason }
+    Warn "$reason : retour a la version precedente."
+    foreach ($other in 'host', 'agent') { if ($Roles -contains $other) { Stop-Role $other } }
+    Switch-Runtime $prev
+    $script:CurrentVersion = (Get-Content (Join-Path $prev 'VERSION') -Raw).Trim()
+    UStatus 'error' $reason
+    foreach ($other in 'host', 'agent') { if ($Roles -contains $other) { Start-Role $other } }
+    if ($role -eq 'host' -and -not (Wait-Host $script:HostPort '' 60)) { Warn 'La version precedente ne repond pas non plus : agentsworld logs host.' }
+    Fail "$reason ; la version $($script:CurrentVersion) a repris."
   }
   $script:Service = if ($NoService) { 'none' } else { 'task' }
 
@@ -287,13 +336,13 @@ const free = (p) => new Promise((resolve) => {
     $http, $link = ([string]$ports).Trim() -split ' '
     Start-Role 'host'
     $script:HostPort = $http
-    if (-not (Wait-Host $http)) {
+    if (-not (Wait-Host $http $V 60)) {
       if ($script:Service -eq 'task') {
         # A task that cannot run now (no interactive logon, e.g. a CI runner) starts at the next logon: run it now.
         Warn 'La tache planifiee ne demarre pas maintenant : demarrage direct en arriere-plan (la tache prendra le relais a la prochaine ouverture de session).'
         Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $Prefix 'host-run.ps1')`"" -WindowStyle Hidden | Out-Null
       }
-      if (-not (Wait-Host $http)) { Fail "L'hote ne repond pas sur le port $http apres 60 s : agentsworld logs host." }
+      if (-not (Wait-Host $http $V 60)) { Rollback 'host' "La version $V de l'hote ne repond pas sur le port $http (/api/health, protocole 3)" }
     }
     Info "Hote en marche : http://127.0.0.1:$http (appareils : port Link $link)."
   }
@@ -303,16 +352,27 @@ const free = (p) => new Promise((resolve) => {
     if ($Name) { $lines += "AGENTSWORLD_MACHINE_NAME=$Name" }
     WriteUtf8 $AgentEnv (($lines -join "`r`n") + "`r`n")
     Start-Role 'agent'
+    Start-Sleep -Seconds 8
+    $alive = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -and $_.CommandLine.Contains($Prefix) -and $_.CommandLine.Contains('agentsworld-agent.mjs') }
+    if (-not $alive) { Rollback 'agent' "La version $V de l'agent s'arrete au demarrage" }
     Info "Agent en marche : il envoie les sessions de cette machine a $Hub."
   }
   function Install-App([bool]$clientOnlyMode) {
-    $setup = Asset "AgentsWorld_${V}_x64-setup.exe"
-    Info 'Installation de l''application (installateur par utilisateur, sans droits administrateur)...'
-    $p = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru -Wait
-    if ($p.ExitCode) { Fail "L'installateur de l'application a echoue (code $($p.ExitCode))." }
-    $script:AppPath = Join-Path $Local 'AgentsWorld\agentsworld.exe'
-    New-Item -ItemType Directory -Force -Path $DesktopHome | Out-Null
     $desktopFile = Join-Path $DesktopHome 'desktop.json'
+    # The same version already installed (an update of other roles): only the mode changes. The app updates itself.
+    $same = $old -and $old.appVersion -eq $Tag -and $AppPath -and (Test-Path $AppPath) -and (Setting 'AGENTSWORLD_REINSTALL' '0') -ne '1'
+    if ($same) {
+      Info "Application $V deja en place : $AppPath"
+    } else {
+      $setup = Asset "AgentsWorld_${V}_x64-setup.exe"
+      Info 'Installation de l''application (installateur par utilisateur, sans droits administrateur)...'
+      $p = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru -Wait
+      if ($p.ExitCode) { Fail "L'installateur de l'application a echoue (code $($p.ExitCode))." }
+      $script:AppPath = Join-Path $Local 'AgentsWorld\agentsworld.exe'
+    }
+    $script:AppVersion = $Tag
+    New-Item -ItemType Directory -Force -Path $DesktopHome | Out-Null
     if ($clientOnlyMode) { WriteUtf8 $desktopFile "{`n  `"mode`": `"join`",`n  `"clientOnly`": true`n}`n" }
     else {
       $mode = $null
@@ -334,9 +394,16 @@ const free = (p) => new Promise((resolve) => {
       default { Fail "Role inconnu dans install.json : $role" }
     }
   }
-  $recordJson = [ordered]@{ roles = @($All); version = $Tag; page = $Page; repo = $Repo; service = $script:Service
-    hostData = $HostData; hostPort = $script:HostPort; appPath = $script:AppPath; desktopHome = $DesktopHome; prefix = $Prefix } | ConvertTo-Json
-  WriteUtf8 $Record $recordJson
+  $record = [ordered]@{ roles = @($All); version = $Tag; page = $Page; repo = $Repo; service = $script:Service
+    hostData = $HostData; hostPort = $script:HostPort; appPath = $script:AppPath; desktopHome = $DesktopHome; prefix = $Prefix
+    appVersion = $(if ($script:AppVersion) { $script:AppVersion } elseif ($old) { $old.appVersion } else { $null })
+    autoUpdate = $(if ($old -and $old.autoUpdate -eq $false) { $false } else { $true }) }
+  # Installers' own tests against a loopback mirror: the automatic updater uses the same mirror.
+  if ($Dev -and (Setting 'AGENTSWORLD_RELEASE_BASE' '')) {
+    $record.dev = [ordered]@{ releaseBase = (Setting 'AGENTSWORLD_RELEASE_BASE' ''); interval = [int](Setting 'AGENTSWORLD_UPDATE_INTERVAL' '0') }
+  }
+  WriteUtf8 $Record ($record | ConvertTo-Json)
+  UStatus 'installed' "Version $Tag en marche" $V
 
   # --- The agentsworld command --------------------------------------------------------------------------------
   $cli = @'
@@ -440,7 +507,15 @@ switch ($Command) {
     if ($R.appPath -and (Test-Path $R.appPath)) { Start-Process $R.appPath }
     elseif (Has 'host') { Start-Process "http://127.0.0.1:$($R.hostPort)/" } else { Write-Host 'Rien a ouvrir.'; exit 1 }
   }
-  'update' { Installer (Options $Rest) }
+  'update' {
+    if ($Rest.Count -ge 2 -and $Rest[0] -eq '--auto') {
+      $R | Add-Member -NotePropertyName autoUpdate -NotePropertyValue ($Rest[1] -eq 'on') -Force
+      [IO.File]::WriteAllText($Record, ($R | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+      Write-Host "Mises a jour automatiques : $($Rest[1]) (verifiees toutes les 15 minutes par l'hote ou l'agent)."
+      exit 0
+    }
+    Installer (Options $Rest)
+  }
   'role' {
     if (-not $Rest.Count) { Write-Host ($Roles -join ' ') }
     elseif ($Rest[0] -eq 'add' -and $Rest.Count -ge 2) {
@@ -475,7 +550,7 @@ switch ($Command) {
       'agentsworld logs [host|agent|app] [-f]  journaux',
       'agentsworld start|stop|restart [host|agent]',
       'agentsworld open                        ouvre l''application (ou la page de l''hote)',
-      'agentsworld update                      met a jour ce qui est installe',
+      'agentsworld update [--auto on|off]      met a jour ce qui est installe (l''hote et l''agent le font seuls)',
       'agentsworld role                        roles installes ; role add <role> [options] ; role remove <role>',
       'agentsworld uninstall [--purge]         desinstalle (--purge : aussi le monde, les appairages et les reglages)'
     ) -join "`n")
@@ -518,6 +593,7 @@ switch ($Command) {
   Info "Commande : $Bin\agentsworld.cmd (ouvre un nouveau terminal pour l'avoir dans le PATH)"
 } catch {
   Write-Host "`nagentsworld: echec : $_" -ForegroundColor Red
+  UStatus 'error' "$_"
   # Run as a file (powershell -File, the update command): report the failure through the exit code.
   if ($MyInvocation.MyCommand.Path) { exit 1 }
 } finally {

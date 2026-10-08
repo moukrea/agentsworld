@@ -29,6 +29,11 @@ propres appareils, et retire un appareil perdu (Réglages › Appareil › Appar
   `--format deb|rpm`, qui passe par le gestionnaire de paquets). Le Node de l'hôte sans écran est le binaire officiel
   de nodejs.org, vérifié avec son `SHASUMS256.txt` au moment de la construction. La page publie aussi le `SHA256SUMS`
   des deux scripts. `curl … | bash` fait confiance à cette page et à GitHub : lis le script avant si tu préfères.
+- **Mises à jour automatiques** de l'hôte sans écran et de l'agent : la page désigne la version, l'archive est vérifiée
+  avec le `SHA256SUMS` de sa release, et si la nouvelle version ne répond pas l'ancienne reprend. L'application Android
+  vérifie aussi le certificat de signature de l'APK avant de le passer à l'installateur d'Android ; l'application de
+  bureau, la signature de sa mise à jour. Quiconque peut publier une release ou la page de ce dépôt peut donc mettre à
+  jour les hôtes et les agents installés : c'est le même pouvoir que sur ce qu'installent les commandes en une ligne.
 
 ## Ce qui n'est pas protégé
 

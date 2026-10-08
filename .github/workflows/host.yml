@@ -160,6 +160,53 @@ jobs:
           sleep 3
           if curl -fsS http://127.0.0.1:14317/api/health; then echo "::error::the host still answers after uninstall"; exit 1; fi
           test ! -e "$cli"
+      # Automatic updates: a host installed at VERSION sees the next patch on the mirror's Page and updates itself
+      # (installer run outside its service: systemd-run, launchd, a new session), keeping its identity; then a broken
+      # release (its server exits at once) is refused: rolled back, reported, the previous version keeps serving.
+      - name: Automatic update and rollback (install.sh)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) plat=linux-x64 ;; Linux-aarch64) plat=linux-arm64 ;;
+            Darwin-arm64) plat=darwin-arm64 ;; Darwin-x86_64) plat=darwin-x64 ;;
+          esac
+          next=$(python3 -c 'import os;a=os.environ["VERSION"].split(".");a[2]=str(int(a[2])+1);print(".".join(a))')
+          broken=$(python3 -c 'import os;a=os.environ["VERSION"].split(".");a[2]=str(int(a[2])+2);print(".".join(a))')
+          work=$(mktemp -d)
+          tar -xzf "mirror/release/agentsworld-host_${VERSION}_${plat}.tar.gz" -C "$work"
+          echo "$next" > "$work/VERSION"
+          tar -czf "mirror/release/agentsworld-host_${next}_${plat}.tar.gz" -C "$work" .
+          echo "$broken" > "$work/VERSION"
+          echo 'process.exit(1);' > "$work/server/agentsworld-server.mjs"
+          tar -czf "mirror/release/agentsworld-host_${broken}_${plat}.tar.gz" -C "$work" .
+          (cd mirror/release && if command -v sha256sum >/dev/null; then sha256sum -- *; else shasum -a 256 -- *; fi > ../SHA256SUMS.new && mv ../SHA256SUMS.new SHA256SUMS)
+          cp .dist/install.sh mirror/install.sh
+          page() { printf '{\n  "version": 1,\n  "release": "v%s",\n  "repository": "moukrea/agentsworld"\n}\n' "$1" > mirror/config.json; }
+          health() { curl -fsS --max-time 3 http://127.0.0.1:14327/api/health 2>/dev/null || true; }
+          version() { health | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null || true; }
+          page "$VERSION"
+          export AGENTSWORLD_DEV_INSTALL=1 AGENTSWORLD_PAGE_URL=http://127.0.0.1:18765 AGENTSWORLD_RELEASE_BASE=http://127.0.0.1:18765/release
+          export AGENTSWORLD_UPDATE_INTERVAL=10 AGENTSWORLD_NO_LINGER=1 AGENTSWORLD_SKIP_PAIR=1
+          sh_bin=bash; if [ "$RUNNER_OS" = macOS ]; then sh_bin=/bin/bash; fi
+          "$sh_bin" .dist/install.sh --host --port 14327 --link-port 14328 --yes
+          prefix="$HOME/.local/share/agentsworld"
+          grep '^service=' "$prefix/install.env"
+          id1=$(curl -fsS http://127.0.0.1:14327/api/link | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"]["hostId"])')
+          page "$next"
+          for i in $(seq 1 120); do [ "$(version)" = "$next" ] && break; sleep 2; done
+          cat "$prefix/update-status.json" || true; tail -n 30 "$prefix/update.log" || true
+          [ "$(version)" = "$next" ] || { echo "::error::the host did not update itself to $next"; exit 1; }
+          id2=$(curl -fsS http://127.0.0.1:14327/api/link | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"]["hostId"])')
+          [ "$id1" = "$id2" ] || { echo "::error::the host identity changed"; exit 1; }
+          page "$broken"
+          for i in $(seq 1 150); do grep -q '"state":"error"' "$prefix/update-status.json" 2>/dev/null && break; sleep 2; done
+          cat "$prefix/update-status.json"; tail -n 20 "$prefix/update.log"
+          grep -q '"state":"error"' "$prefix/update-status.json" || { echo "::error::the broken release was not reported"; exit 1; }
+          for i in $(seq 1 30); do [ "$(version)" = "$next" ] && break; sleep 2; done
+          [ "$(version)" = "$next" ] || { echo "::error::the previous version is not serving after the rollback"; exit 1; }
+          health | python3 -c 'import json,sys;u=[s for s in json.load(sys.stdin)["sources"] if s.get("name")=="updates"];print(u);assert u'
+          "$HOME/.local/bin/agentsworld" uninstall --purge
       - name: install.sh --client-only (latest published release)
         if: runner.os != 'Windows' && matrix.os != 'ubuntu-24.04-arm'
         env:
@@ -205,6 +252,43 @@ jobs:
           $still = $true; try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:14317/api/health -TimeoutSec 3 | Out-Null } catch { $still = $false }
           if ($still) { throw 'the host still answers after uninstall' }
           if (Get-ScheduledTask -TaskName 'AgentsWorld host' -ErrorAction SilentlyContinue) { throw 'the scheduled task is still there' }
+      - name: Automatic update and rollback (install.ps1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = $env:VERSION.Split('.'); $next = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"; $broken = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 2)"
+          $work = Join-Path $env:RUNNER_TEMP 'repack'
+          Expand-Archive -Path "mirror\release\agentsworld-host_$($env:VERSION)_windows-x64.zip" -DestinationPath $work -Force
+          [IO.File]::WriteAllText("$work\VERSION", "$next`n")
+          Compress-Archive -Path "$work\*" -DestinationPath "mirror\release\agentsworld-host_${next}_windows-x64.zip" -Force
+          [IO.File]::WriteAllText("$work\VERSION", "$broken`n")
+          [IO.File]::WriteAllText("$work\server\agentsworld-server.mjs", "process.exit(1);`n")
+          Compress-Archive -Path "$work\*" -DestinationPath "mirror\release\agentsworld-host_${broken}_windows-x64.zip" -Force
+          $sums = Get-ChildItem mirror\release -File | Where-Object { $_.Name -ne 'SHA256SUMS' } | ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower())  $($_.Name)" }
+          [IO.File]::WriteAllText("$PWD\mirror\release\SHA256SUMS", (($sums -join "`n") + "`n"))
+          Copy-Item .dist\install.ps1 mirror\install.ps1
+          function Page($v) { [IO.File]::WriteAllText("$PWD\mirror\config.json", "{`n  `"version`": 1,`n  `"release`": `"v$v`",`n  `"repository`": `"moukrea/agentsworld`"`n}`n") }
+          function HostVersion { try { (Invoke-RestMethod -UseBasicParsing http://127.0.0.1:14327/api/health -TimeoutSec 3).version } catch { '' } }
+          Page $env:VERSION
+          $env:AGENTSWORLD_DEV_INSTALL = '1'; $env:AGENTSWORLD_PAGE_URL = 'http://127.0.0.1:18765'
+          $env:AGENTSWORLD_RELEASE_BASE = 'http://127.0.0.1:18765/release'; $env:AGENTSWORLD_UPDATE_INTERVAL = '10'; $env:AGENTSWORLD_SKIP_PAIR = '1'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .dist\install.ps1 -Host -Port 14327 -LinkPort 14328 -Yes
+          if ($LASTEXITCODE) { throw "install.ps1 failed ($LASTEXITCODE)" }
+          $prefix = Join-Path $env:LOCALAPPDATA 'agentsworld-cli'
+          Get-Content "$prefix\install.json"
+          Page $next
+          for ($i = 0; $i -lt 120 -and (HostVersion) -ne $next; $i++) { Start-Sleep -Seconds 2 }
+          Get-Content "$prefix\update-status.json" -ErrorAction SilentlyContinue; Get-Content "$prefix\update.log" -Tail 30 -ErrorAction SilentlyContinue
+          if ((HostVersion) -ne $next) { throw "the host did not update itself to $next" }
+          Page $broken
+          for ($i = 0; $i -lt 150 -and -not ((Get-Content "$prefix\update-status.json" -Raw -ErrorAction SilentlyContinue) -match '"state":"error"'); $i++) { Start-Sleep -Seconds 2 }
+          Get-Content "$prefix\update-status.json"; Get-Content "$prefix\update.log" -Tail 20
+          if (-not ((Get-Content "$prefix\update-status.json" -Raw) -match '"state":"error"')) { throw 'the broken release was not reported' }
+          for ($i = 0; $i -lt 30 -and (HostVersion) -ne $next; $i++) { Start-Sleep -Seconds 2 }
+          if ((HostVersion) -ne $next) { throw 'the previous version is not serving after the rollback' }
+          & "$prefix\bin\agentsworld.cmd" uninstall --purge
+          if ($LASTEXITCODE) { throw "uninstall failed ($LASTEXITCODE)" }
       - name: install.ps1 -ClientOnly (latest published release)
         if: runner.os == 'Windows'
         shell: powershell

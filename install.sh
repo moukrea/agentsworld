@@ -17,11 +17,21 @@ umask 077
 
 STAGE='initialisation'
 # shellcheck disable=SC2154
-trap 'rc=$?; printf "\nagentsworld: échec pendant « %s » (ligne %s, code %s). Voir l’erreur ci-dessus ; rien de ce qui marchait n’a été remplacé.\n" "$STAGE" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+trap 'rc=$?; printf "\nagentsworld: échec pendant « %s » (ligne %s, code %s). Voir l’erreur ci-dessus ; rien de ce qui marchait n’a été remplacé.\n" "$STAGE" "$LINENO" "$rc" >&2; ustatus error "échec pendant : $STAGE"; exit "$rc"' ERR
+# The update status the host reports (server/self-update.mjs): only written once the roles are known (TRACK=1).
+TRACK=0
+ustatus() {
+  [[ "$TRACK" == 1 ]] || return 0
+  local msg="${2//\\/\\\\}" failed='' file="$PREFIX/update-status.json" version="${3:-$CURRENT_VERSION}"
+  msg="${msg//\"/\\\"}"
+  if [[ "$1" == error ]]; then failed=",\"failed\":{\"tag\":\"${TAG:-}\",\"at\":$(date +%s),\"reason\":\"$msg\"}"; fi
+  printf '{"state":"%s","target":"%s","version":"%s","at":%s,"message":"%s"%s}\n' \
+    "$1" "${TAG:-}" "$version" "$(date +%s)" "$msg" "$failed" > "$file.new" 2>/dev/null && mv -f "$file.new" "$file" || true
+}
 say() { printf '\n  AgentsWorld · %s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*" >&2; }
-fail() { trap - ERR; printf '\nagentsworld: %s\n' "$*" >&2; exit 1; }
+fail() { trap - ERR; printf '\nagentsworld: %s\n' "$*" >&2; ustatus error "$*"; exit 1; }
 
 usage() {
   cat <<'USAGE'
@@ -46,11 +56,12 @@ Options :
   --no-service          démarre l'hôte ou l'agent en arrière-plan au lieu d'un service
   --no-pair             n'affiche pas de code d'appairage à la fin
   -y, --yes             ne pose aucune question
+  --only-services       met à jour seulement l'hôte et l'agent installés (mise à jour automatique)
 USAGE
 }
 
 # --- Arguments ------------------------------------------------------------------------------------------------
-ROLE='' HUB='' TOKEN='' AGENT_NAME='' PORT='' LINK_PORT='' RELAY='' BIND='' FORMAT='' WANT_VERSION='' YES=0
+ROLE='' HUB='' TOKEN='' AGENT_NAME='' PORT='' LINK_PORT='' RELAY='' BIND='' FORMAT='' WANT_VERSION='' YES=0 ONLY_SERVICES=0
 NO_SERVICE="${AGENTSWORLD_NO_SERVICE:-0}" NO_PAIR="${AGENTSWORLD_SKIP_PAIR:-0}"
 set_role() { [[ -z "$ROLE" || "$ROLE" == "$1" ]] || fail "Un seul rôle à la fois (--$ROLE et --$1)."; ROLE="$1"; }
 need_value() { [[ $# -ge 2 && -n "$2" ]] || fail "$1 attend une valeur."; }
@@ -72,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --no-service) NO_SERVICE=1 ;;
     --no-pair) NO_PAIR=1 ;;
     -y|--yes) YES=1 ;;
+    --only-services) ONLY_SERVICES=1; YES=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; fail "Option inconnue : $1" ;;
   esac
@@ -136,7 +148,12 @@ if command -v jaunt >/dev/null 2>&1 || [[ -x "$HOME/.local/bin/jaunt" || -d "${J
 DISPLAY_OK=0
 if [[ "$OS" == Darwin || -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then DISPLAY_OK=1; fi
 
-if [[ -z "$ROLE" && -n "$INSTALLED_ROLES" && "$TTY" != 1 ]]; then
+if [[ "$ONLY_SERVICES" == 1 ]]; then
+  # The automatic update: the host and the agent only (the desktop app updates itself).
+  ROLES=''
+  for role in $INSTALLED_ROLES; do case "$role" in host|agent) ROLES="${ROLES:+$ROLES }$role" ;; esac; done
+  [[ -n "$ROLES" ]] || { info 'Ni hôte ni agent installé : rien à mettre à jour.'; exit 0; }
+elif [[ -z "$ROLE" && -n "$INSTALLED_ROLES" && "$TTY" != 1 ]]; then
   ROLES="$INSTALLED_ROLES"   # an update: every installed role, without asking
 elif [[ -z "$ROLE" && "$TTY" == 1 ]]; then
   if [[ "$DISPLAY_OK" == 1 ]]; then RECOMMENDED=1; else RECOMMENDED=3; fi
@@ -194,6 +211,8 @@ case "$BIND" in ''|127.0.0.1|0.0.0.0|::|::1) ;; *) [[ "$BIND" =~ ^[0-9]{1,3}(\.[
 [[ -z "$FORMAT" || "$OS" == Linux ]] || fail '--format ne concerne que Linux.'
 
 # --- Downloads ------------------------------------------------------------------------------------------------
+CURRENT_VERSION="$(cat "$PREFIX/runtime/current/VERSION" 2>/dev/null || true)"
+case " $ROLES " in *" host "*|*" agent "*) TRACK=1 ;; esac
 mkdir -p "$PREFIX" "$BIN"
 chmod 700 "$PREFIX"
 TMP="$(mktemp -d "$PREFIX/.install.XXXXXXXX")"
@@ -226,6 +245,7 @@ TAG="$WANT_VERSION"; [[ "$TAG" == v* ]] || TAG="v$TAG"
 VERSION="${TAG#v}"
 BASE="${AGENTSWORLD_RELEASE_BASE:-https://github.com/$REPO/releases/download/$TAG}"; BASE="${BASE%/}"
 say "Version $TAG ($ROLES)"
+ustatus downloading "Téléchargement de $TAG"
 fetch "$BASE/SHA256SUMS" "$TMP/SHA256SUMS"
 
 # Download one release asset and check it against SHA256SUMS; nothing unverified is ever kept.
@@ -363,6 +383,7 @@ install_runtime() {
   STAGE="téléchargement du moteur $TAG"
   asset "$name"
   STAGE='installation du moteur'
+  ustatus installing "Installation de $TAG"
   mkdir -p "$RUNTIME/versions"
   target="$RUNTIME/versions/$TAG-$(date +%s)-$$"
   mkdir -p "$target"
@@ -370,19 +391,76 @@ install_runtime() {
   # The new runtime must run here before anything points at it.
   node_version="$("$target/bin/node" --version 2>/dev/null)" || { rm -rf "$target"; fail 'Le Node fourni ne démarre pas sur ce système.'; }
   [[ -f "$target/server/agentsworld-server.mjs" && -f "$target/cli/agentsworld.mjs" ]] || { rm -rf "$target"; fail 'Archive du moteur incomplète.'; }
-  # Switch `current` atomically (rename over the old link), then keep the previous version for a rollback.
-  "$target/bin/node" -e '
+  # Keep the runtime that runs now for a rollback (install_host / install_agent switch back if the new one fails).
+  if [[ -L "$RT" ]]; then PREV_RT="$(cd -P "$RT" 2>/dev/null && pwd || true)"; fi
+  switch_runtime "$target/bin/node" "$target" "$PREV_RT"
+  info "Moteur $VERSION installé (Node $node_version)."
+}
+
+PREV_RT=''
+# Point `current` at a runtime atomically (rename over the old link). With a third argument (the runtime that ran
+# until now, possibly empty), every other version is removed: the new one and that one are kept for a rollback.
+switch_runtime() {
+  "$1" -e '
     const fs = require("fs"), path = require("path");
-    const [runtime, target] = process.argv.slice(1), tmp = path.join(runtime, "current.new");
+    const [runtime, target, keep] = process.argv.slice(1), tmp = path.join(runtime, "current.new");
     fs.rmSync(tmp, {force: true});
     fs.symlinkSync(target, tmp);
     fs.renameSync(tmp, path.join(runtime, "current"));
+    if (process.argv.length < 4) process.exit(0);
     const versions = path.join(runtime, "versions");
-    const dirs = fs.readdirSync(versions).map((d) => path.join(versions, d)).filter((d) => d !== target)
-      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-    for (const old of dirs.slice(1)) fs.rmSync(old, {recursive: true, force: true});
-  ' "$RUNTIME" "$target"
-  info "Moteur $VERSION installé (Node $node_version)."
+    const kept = new Set([target, keep].filter(Boolean).map((d) => fs.realpathSync(d)));
+    for (const name of fs.readdirSync(versions)) {
+      const dir = path.join(versions, name);
+      if (!kept.has(fs.realpathSync(dir))) fs.rmSync(dir, {recursive: true, force: true});
+    }
+  ' "$RUNTIME" "$2" ${3+"$3"}
+}
+
+# The host answers /api/health with this protocol and, when given, this version.
+PROTOCOL=3
+host_healthy() {
+  local out
+  out="$(curl -fsS --max-time 2 "http://127.0.0.1:$1/api/health" 2>/dev/null)" || return 1
+  [[ "$out" == *"\"protocol\":$PROTOCOL"* ]] || return 1
+  [[ -z "${2:-}" || "$out" == *"\"version\":\"$2\""* ]]
+}
+wait_host() {
+  for _ in $(seq 1 "${3:-60}"); do
+    if host_healthy "$1" "${2:-}"; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# The agent is still running a few seconds after its start.
+agent_alive() {
+  sleep 8
+  case "$SERVICE" in
+    systemd) systemctl --user is-active --quiet "$AGENT_UNIT" ;;
+    launchd) launchctl print "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null | grep -q 'state = running' \
+               || launchctl print "user/$(id -u)/$AGENT_LABEL" 2>/dev/null | grep -q 'state = running' ;;
+    *) pid_alive "$PREFIX/agent.pid" ;;
+  esac
+}
+
+# The new runtime does not serve: back to the previous one, restarted, and the update reported as failed.
+rollback() {
+  local role="$1" reason="$2"
+  if [[ -z "$PREV_RT" || ! -x "$PREV_RT/bin/node" || "$PREV_RT" == "$(cd -P "$RT" && pwd)" ]]; then fail "$reason"; fi
+  warn "$reason : retour à la version précédente."
+  switch_runtime "$PREV_RT/bin/node" "$PREV_RT"
+  CURRENT_VERSION="$(cat "$PREV_RT/VERSION" 2>/dev/null || true)"
+  # Before the restart: the previous runtime reports this failure as soon as it is back.
+  ustatus error "$reason"
+  local again=() other
+  for other in $ROLES; do case "$other" in host|agent) again+=("$other") ;; esac; done
+  for other in "${again[@]}"; do
+    if [[ "$other" == host ]]; then node_cmd server/agentsworld-server.mjs; service_up host "${NODE_RUN[@]}" --config "$HOST_DATA/config.json"
+    else node_cmd agent/agentsworld-agent.mjs; service_up agent "${NODE_RUN[@]}"; fi
+  done
+  if [[ "$role" == host ]] && ! wait_host "$HOST_PORT" '' 60; then warn 'La version précédente ne répond pas non plus : « agentsworld logs host ».'; fi
+  fail "$reason ; la version $CURRENT_VERSION a repris."
 }
 
 NODE_RUN=()
@@ -441,12 +519,9 @@ install_host() {
   node_cmd server/agentsworld-server.mjs
   service_up host "${NODE_RUN[@]}" --config "$HOST_DATA/config.json"
   HOST_PORT="$http"
-  local i
-  for i in $(seq 1 60); do
-    if curl -fsS --max-time 2 "http://127.0.0.1:$http/api/health" >/dev/null 2>&1; then break; fi
-    if [[ "$i" == 60 ]]; then fail "L’hôte ne répond pas sur le port $http après 60 s : « agentsworld logs host »."; fi
-    sleep 1
-  done
+  if ! wait_host "$http" "$VERSION" 90; then
+    rollback host "La version $VERSION de l’hôte ne répond pas sur le port $http (/api/health, protocole $PROTOCOL)"
+  fi
   info "Hôte en marche : http://127.0.0.1:$http (appareils : port Link $link)."
 }
 
@@ -472,6 +547,7 @@ install_agent() {
   service_stop agent
   node_cmd agent/agentsworld-agent.mjs
   service_up agent "${NODE_RUN[@]}"
+  if ! agent_alive; then rollback agent "La version $VERSION de l’agent s’arrête au démarrage"; fi
   info "Agent en marche : il envoie les sessions de cette machine à $HUB."
 }
 
@@ -491,8 +567,16 @@ desktop_mode() {
 
 APP_PATH=''
 install_app() {
-  local client_only="$1"
+  local client_only="$1" previous
   STAGE='installation de l’application'
+  # The same version already installed (an update of other roles): only the mode changes. The app updates itself.
+  previous="$(record_get app_path)"
+  if [[ "$(record_get app_version)" == "$TAG" && -n "$previous" && -e "$previous" && "${FORMAT:-appimage}" == "$(r="$(record_get app_format)"; printf '%s' "${r:-appimage}")" && "${AGENTSWORLD_REINSTALL:-0}" != 1 ]]; then
+    APP_PATH="$previous"
+    desktop_mode "$client_only"
+    info "Application $VERSION déjà en place : $APP_PATH"
+    return
+  fi
   if [[ "$OS" == Linux ]]; then
     [[ "$PLATFORM" == linux-x64 ]] || fail "L’application de bureau n’existe pas pour Linux $ARCH. L’hôte sans écran (--host) et l’app Android, oui."
     case "${FORMAT:-appimage}" in
@@ -559,6 +643,12 @@ write_record() {
     printf 'roles=%s\nversion=%s\npage=%s\nrepo=%s\nos=%s\nservice=%s\n' "$1" "$TAG" "$PAGE" "$REPO" "$OS" "$SERVICE"
     printf 'host_data=%s\nhost_port=%s\napp_path=%s\napp_format=%s\ndesktop_home=%s\n' \
       "$HOST_DATA" "${HOST_PORT:-$(record_get host_port)}" "${APP_PATH:-$(record_get app_path)}" "${FORMAT:-$(record_get app_format)}" "$DESKTOP_HOME"
+    printf 'auto_update=%s\n' "$(r="$(record_get auto_update)"; printf '%s' "${r:-1}")"
+    if [[ -n "$APP_PATH" ]]; then printf 'app_version=%s\n' "$TAG"; else printf 'app_version=%s\n' "$(record_get app_version)"; fi
+    # Installers' own tests against a loopback mirror: the automatic updater uses the same mirror.
+    if [[ "$DEV" == 1 && -n "${AGENTSWORLD_RELEASE_BASE:-}" ]]; then
+      printf 'dev_release_base=%s\ndev_update_interval=%s\n' "$AGENTSWORLD_RELEASE_BASE" "${AGENTSWORLD_UPDATE_INTERVAL:-}"
+    fi
   } > "$RECORD.new"
   chmod 600 "$RECORD.new"
   mv -f "$RECORD.new" "$RECORD"
@@ -657,7 +747,7 @@ agentsworld agent-token create <nom>    jeton + commande d'installation d'un age
 agentsworld logs [host|agent|app] [-f]  journaux
 agentsworld start|stop|restart [host|agent]
 agentsworld open                        ouvre l'application (ou la page de l'hôte)
-agentsworld update                      met à jour ce qui est installé
+agentsworld update [--auto on|off]      met à jour ce qui est installé (l'hôte et l'agent le font seuls)
 agentsworld role                        rôles installés ; role add <app|client-only|host|agent> [options] ; role remove <rôle>
 agentsworld uninstall [--purge]         désinstalle (--purge : aussi le monde, les appairages et les réglages)
 USAGE
@@ -696,7 +786,15 @@ case "$command" in
     elif has host; then
       url="http://127.0.0.1:$(rec host_port)/"; command -v xdg-open >/dev/null && xdg-open "$url" || { command -v open >/dev/null && open "$url"; } || echo "$url"
     else echo "Rien à ouvrir." >&2; exit 1; fi ;;
-  update) installer --yes "$@" ;;
+  update)
+    if [[ "${1:-}" == --auto ]]; then
+      case "${2:-}" in on) v=1 ;; off) v=0 ;; *) echo "agentsworld update --auto on|off" >&2; exit 2 ;; esac
+      if grep -q '^auto_update=' "$RECORD"; then sed -i.bak "s/^auto_update=.*/auto_update=$v/" "$RECORD" && rm -f "$RECORD.bak"
+      else echo "auto_update=$v" >> "$RECORD"; fi
+      echo "Mises à jour automatiques : $2 (vérifiées toutes les 15 minutes par l’hôte ou l’agent)."
+      exit 0
+    fi
+    installer --yes "$@" ;;
   role)
     sub="${1:-}"; shift || true
     case "$sub" in
@@ -742,6 +840,7 @@ done
 STAGE='commande agentsworld'
 write_record "$ALL_ROLES"
 write_cli
+ustatus installed "Version $TAG en marche" "$VERSION"
 
 say "Prêt ($TAG)"
 case ":$PATH:" in *":$BIN:"*) ;; *) info "Ajoute $BIN à ton PATH pour avoir la commande « agentsworld » (ex. dans ~/.profile : export PATH=\"$BIN:\$PATH\")." ;; esac
