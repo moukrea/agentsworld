@@ -121,7 +121,7 @@ jobs:
           set -euo pipefail
           cd mirror
           printf '{\n  "version": 1,\n  "release": "v%s",\n  "repository": "moukrea/agentsworld"\n}\n' "$VERSION" > config.json
-          (cd release && { command -v sha256sum >/dev/null && sha256sum -- * || shasum -a 256 -- *; } > SHA256SUMS && cat SHA256SUMS)
+          (cd release && if command -v sha256sum >/dev/null; then sha256sum -- *; else shasum -a 256 -- *; fi > ../SHA256SUMS && mv ../SHA256SUMS . && cat SHA256SUMS)
           py=$(command -v python3 || command -v python)
           "$py" -m http.server 18765 --bind 127.0.0.1 > ../mirror.log 2>&1 &
           for i in $(seq 1 20); do curl -fsS http://127.0.0.1:18765/config.json >/dev/null 2>&1 && break; sleep 1; done
@@ -137,14 +137,17 @@ jobs:
           export AGENTSWORLD_DEV_INSTALL=1 AGENTSWORLD_PAGE_URL=http://127.0.0.1:18765 AGENTSWORLD_RELEASE_BASE=http://127.0.0.1:18765/release
           export AGENTSWORLD_INSTALLER="$PWD/.dist/install.sh" AGENTSWORLD_NO_LINGER=1
           cli="$HOME/.local/bin/agentsworld"
-          bash .dist/install.sh --host --port 14317 --link-port 14318 --yes
+          # `curl … | bash` on macOS is /bin/bash 3.2: test that one.
+          sh_bin=bash; if [ "$RUNNER_OS" = macOS ]; then sh_bin=/bin/bash; fi
+          "$sh_bin" --version | head -n 1
+          "$sh_bin" .dist/install.sh --host --port 14317 --link-port 14318 --yes
           "$cli" status
           id1=$("$cli" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["link"]["hostId"])')
           "$cli" pair --json | grep -q '"code":"aw1\.'
           token=$("$cli" agent-token create CI | grep -o 'ah_agent_[A-Za-z0-9_-]*' | head -n 1)
           # The agent of another user of this machine: its own HOME, without a service.
           agent_home=$(mktemp -d)
-          HOME="$agent_home" AGENTSWORLD_NO_SERVICE=1 bash .dist/install.sh --agent --hub http://127.0.0.1:14317 --token "$token" --name CI --yes
+          HOME="$agent_home" AGENTSWORLD_NO_SERVICE=1 "$sh_bin" .dist/install.sh --agent --hub http://127.0.0.1:14317 --token "$token" --name CI --yes
           sleep 8
           HOME="$agent_home" "$agent_home/.local/bin/agentsworld" status
           grep -q 'agent' "$agent_home/.local/share/agentsworld/agent.log"
@@ -165,7 +168,8 @@ jobs:
           set -euo pipefail
           tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
           home=$(mktemp -d)
-          HOME="$home" AGENTSWORLD_VERSION="$tag" AGENTSWORLD_APPS_DIR="$home/Applications" bash .dist/install.sh --client-only --yes
+          sh_bin=bash; if [ "$RUNNER_OS" = macOS ]; then sh_bin=/bin/bash; fi
+          HOME="$home" AGENTSWORLD_VERSION="$tag" AGENTSWORLD_APPS_DIR="$home/Applications" "$sh_bin" .dist/install.sh --client-only --yes
           if [ "$RUNNER_OS" = macOS ]; then
             test -x "$home/Applications/AgentsWorld.app/Contents/MacOS/agentsworld"
             grep -q '"clientOnly": true' "$home/Library/Application Support/io.github.moukrea.agentsworld/desktop.json"

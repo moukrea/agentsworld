@@ -112,7 +112,7 @@ fi
 REPO_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 [[ "$REPO" =~ $REPO_RE ]] || fail 'Nom de dépôt invalide.'
 
-record_get() { [[ -f "$RECORD" ]] && sed -n "s/^$1=//p" "$RECORD" | tail -n 1 || true; }
+record_get() { if [[ -f "$RECORD" ]]; then sed -n "s/^$1=//p" "$RECORD" | tail -n 1; fi; }
 INSTALLED_ROLES="$(record_get roles)"
 if [[ "$OS" == Linux && -z "$FORMAT" ]]; then FORMAT="$(record_get app_format)"; fi
 # An update keeps how the host and the agent run: a host installed with --no-service stays without one.
@@ -531,7 +531,7 @@ Categories=Game;
 StartupWMClass=agentsworld
 DESKTOP
         chmod 644 "$apps/agentsworld.desktop"
-        command -v update-desktop-database >/dev/null && update-desktop-database "$apps" >/dev/null 2>&1 || true ;;
+        if command -v update-desktop-database >/dev/null; then update-desktop-database "$apps" >/dev/null 2>&1 || true; fi ;;
     esac
   else
     local arch name dest="$APPS_DIR/AgentsWorld.app"

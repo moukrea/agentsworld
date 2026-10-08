@@ -482,7 +482,9 @@ switch ($Command) {
 }
 '@
   WriteUtf8 (Join-Path $Bin 'agentsworld.ps1') $cli
-  WriteUtf8 (Join-Path $Bin 'agentsworld.cmd') "@powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0agentsworld.ps1`" %*`r`n"
+  # One line ending with `exit /b`: cmd parses the whole line first, so `agentsworld uninstall`, which deletes this
+  # file, does not leave cmd looking for a next line in it (exit /b keeps PowerShell's exit code).
+  WriteUtf8 (Join-Path $Bin 'agentsworld.cmd') "@powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0agentsworld.ps1`" %* & exit /b`r`n"
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (($userPath -split ';') -notcontains $Bin) { [Environment]::SetEnvironmentVariable('Path', (@($userPath, $Bin) | Where-Object { $_ }) -join ';', 'User') }
   $env:Path = "$Bin;$env:Path"
