@@ -25,8 +25,10 @@ ustatus() {
   local msg="${2//\\/\\\\}" failed='' file="$PREFIX/update-status.json" version="${3:-$CURRENT_VERSION}"
   msg="${msg//\"/\\\"}"
   if [[ "$1" == error ]]; then failed=",\"failed\":{\"tag\":\"${TAG:-}\",\"at\":$(date +%s),\"reason\":\"$msg\"}"; fi
-  printf '{"state":"%s","target":"%s","version":"%s","at":%s,"message":"%s"%s}\n' \
-    "$1" "${TAG:-}" "$version" "$(date +%s)" "$msg" "$failed" > "$file.new" 2>/dev/null && mv -f "$file.new" "$file" || true
+  if printf '{"state":"%s","target":"%s","version":"%s","at":%s,"message":"%s"%s}\n' \
+    "$1" "${TAG:-}" "$version" "$(date +%s)" "$msg" "$failed" > "$file.new" 2>/dev/null; then
+    mv -f "$file.new" "$file" 2>/dev/null || true
+  fi
 }
 say() { printf '\n  AgentsWorld · %s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -389,10 +391,11 @@ install_runtime() {
   mkdir -p "$target"
   tar -xzf "$TMP/$name" -C "$target" || { rm -rf "$target"; fail 'Archive du moteur illisible.'; }
   # The new runtime must run here before anything points at it.
-  node_version="$("$target/bin/node" --version 2>/dev/null)" || { rm -rf "$target"; fail 'Le Node fourni ne démarre pas sur ce système.'; }
+  node_version="$("$target/bin/node" --version 2>/dev/null || true)"
+  [[ -n "$node_version" ]] || { rm -rf "$target"; fail 'Le Node fourni ne démarre pas sur ce système.'; }
   [[ -f "$target/server/agentsworld-server.mjs" && -f "$target/cli/agentsworld.mjs" ]] || { rm -rf "$target"; fail 'Archive du moteur incomplète.'; }
   # Keep the runtime that runs now for a rollback (install_host / install_agent switch back if the new one fails).
-  if [[ -L "$RT" ]]; then PREV_RT="$(cd -P "$RT" 2>/dev/null && pwd || true)"; fi
+  if [[ -L "$RT" ]] && [[ -d "$RT" ]]; then PREV_RT="$(cd -P "$RT" && pwd)"; fi
   switch_runtime "$target/bin/node" "$target" "$PREV_RT"
   info "Moteur $VERSION installé (Node $node_version)."
 }
@@ -419,9 +422,11 @@ switch_runtime() {
 
 # The host answers /api/health with this protocol and, when given, this version.
 PROTOCOL=3
+# (Inside $(…) a failing command would run the ERR trap: set -E. Hence the `|| true` in command substitutions.)
 host_healthy() {
   local out
-  out="$(curl -fsS --max-time 2 "http://127.0.0.1:$1/api/health" 2>/dev/null)" || return 1
+  out="$(curl -fsS --max-time 2 "http://127.0.0.1:$1/api/health" 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
   [[ "$out" == *"\"protocol\":$PROTOCOL"* ]] || return 1
   [[ -z "${2:-}" || "$out" == *"\"version\":\"$2\""* ]]
 }
@@ -502,7 +507,7 @@ host_config() {
       }
       console.log(`${http} ${link}`);
     })();
-  ' "$file" "$PORT" "$LINK_PORT" "$RELAY" "$1" "$BIND" "$JAUNT"
+  ' "$file" "$PORT" "$LINK_PORT" "$RELAY" "$1" "$BIND" "$JAUNT" || return 3
 }
 
 install_host() {

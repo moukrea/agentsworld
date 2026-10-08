@@ -394,15 +394,16 @@ const free = (p) => new Promise((resolve) => {
       default { Fail "Role inconnu dans install.json : $role" }
     }
   }
-  $record = [ordered]@{ roles = @($All); version = $Tag; page = $Page; repo = $Repo; service = $script:Service
+  # Not $record: PowerShell variable names ignore case, that would be $Record (the file).
+  $recordData = [ordered]@{ roles = @($All); version = $Tag; page = $Page; repo = $Repo; service = $script:Service
     hostData = $HostData; hostPort = $script:HostPort; appPath = $script:AppPath; desktopHome = $DesktopHome; prefix = $Prefix
     appVersion = $(if ($script:AppVersion) { $script:AppVersion } elseif ($old) { $old.appVersion } else { $null })
     autoUpdate = $(if ($old -and $old.autoUpdate -eq $false) { $false } else { $true }) }
   # Installers' own tests against a loopback mirror: the automatic updater uses the same mirror.
   if ($Dev -and (Setting 'AGENTSWORLD_RELEASE_BASE' '')) {
-    $record.dev = [ordered]@{ releaseBase = (Setting 'AGENTSWORLD_RELEASE_BASE' ''); interval = [int](Setting 'AGENTSWORLD_UPDATE_INTERVAL' '0') }
+    $recordData.dev = [ordered]@{ releaseBase = (Setting 'AGENTSWORLD_RELEASE_BASE' ''); interval = [int](Setting 'AGENTSWORLD_UPDATE_INTERVAL' '0') }
   }
-  WriteUtf8 $Record ($record | ConvertTo-Json)
+  WriteUtf8 $Record ($recordData | ConvertTo-Json)
   UStatus 'installed' "Version $Tag en marche" $V
 
   # --- The agentsworld command --------------------------------------------------------------------------------
