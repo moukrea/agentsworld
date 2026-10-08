@@ -813,7 +813,8 @@ case "$command" in
   uninstall)
     purge=0; [[ "${1:-}" == --purge ]] && purge=1
     for role in $ROLES; do remove_role "$role" "$purge"; done
-    rm -rf "$PREFIX/runtime" "$PREFIX/app" "$PREFIX"/.install.* "$PREFIX"/*.pid
+    rm -rf "$PREFIX/runtime" "$PREFIX/app" "$PREFIX/update" "$PREFIX"/.install.* "$PREFIX"/*.pid
+    rm -f "$PREFIX/update-status.json"
     [[ "$purge" == 1 ]] && rm -f "$PREFIX"/*.log
     rm -f "$RECORD" "$0"
     rmdir "$PREFIX" 2>/dev/null

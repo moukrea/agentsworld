@@ -280,7 +280,13 @@ jobs:
           Page $next
           for ($i = 0; $i -lt 120 -and (HostVersion) -ne $next; $i++) { Start-Sleep -Seconds 2 }
           Get-Content "$prefix\update-status.json" -ErrorAction SilentlyContinue; Get-Content "$prefix\update.log" -Tail 30 -ErrorAction SilentlyContinue
-          if ((HostVersion) -ne $next) { throw "the host did not update itself to $next" }
+          if ((HostVersion) -ne $next) {
+            Get-ChildItem "$prefix\update" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
+            Get-Content "$prefix\update\launch.log" -ErrorAction SilentlyContinue
+            Get-Content "$prefix\host.log" -Tail 20 -ErrorAction SilentlyContinue
+            Get-ScheduledTask -TaskName 'AgentsWorld update' -ErrorAction SilentlyContinue | Get-ScheduledTaskInfo | Format-List LastRunTime, LastTaskResult, NumberOfMissedRuns
+            throw "the host did not update itself to $next"
+          }
           Page $broken
           for ($i = 0; $i -lt 150 -and -not ((Get-Content "$prefix\update-status.json" -Raw -ErrorAction SilentlyContinue) -match '"state":"error"'); $i++) { Start-Sleep -Seconds 2 }
           Get-Content "$prefix\update-status.json"; Get-Content "$prefix\update.log" -Tail 20

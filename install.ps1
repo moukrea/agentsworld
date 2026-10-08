@@ -531,7 +531,9 @@ switch ($Command) {
   'uninstall' {
     $purge = $Rest -contains '--purge'
     foreach ($role in @($Roles)) { RemoveRole $role $purge }
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $Prefix 'runtime')
+    # The automatic updater's one-shot task (server/self-update.mjs).
+    try { Unregister-ScheduledTask -TaskName 'AgentsWorld update' -Confirm:$false -ErrorAction Stop } catch { }
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $Prefix 'runtime'), (Join-Path $Prefix 'update')
     if ($purge) { Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Prefix '*.log') }
     Remove-Item -Force -ErrorAction SilentlyContinue $Record
     $bin = Join-Path $Prefix 'bin'
