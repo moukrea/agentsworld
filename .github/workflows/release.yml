@@ -1,8 +1,9 @@
 name: Release
 # Runs in the PUBLIC repository moukrea/agentsworld (copied from ops/public/ of the private source by
 # scripts/sync_public_ops.sh, see docs/DEPLOYMENT.md of the source). Builds one commit of the private source: the
-# Android APK (android.yml) and the desktop apps (desktop.yml), then publishes them as ONE release vX.Y.Z of this
-# repository with SHA256SUMS and the desktop updater manifest latest.json. The installed desktop apps read
+# Android APK (android.yml), the desktop apps (desktop.yml) and the headless host archives (host.yml, which also tests
+# install.sh / install.ps1 against them), then publishes them as ONE release vX.Y.Z of this repository with SHA256SUMS
+# and the desktop updater manifest latest.json, and points the installers' page at it (pages.yml). The installed desktop apps read
 # https://github.com/moukrea/agentsworld/releases/latest/download/latest.json (app-desktop/src-tauri/tauri.conf.json):
 # publishing makes the update available at once; `draft: true` keeps it as a draft to check first.
 #
@@ -72,8 +73,17 @@ jobs:
     # Its build reads the `release` environment's secrets, which GitHub hands to a called workflow only through
     # inherit (as Jaunt's auto-release.yml); the repository-level secret inherited is SOURCE_READ_KEY.
     secrets: inherit
+  host:
+    needs: guard
+    permissions:
+      contents: read
+    uses: ./.github/workflows/host.yml
+    with:
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version }}
+    secrets: inherit
   publish:
-    needs: [android, desktop]
+    needs: [android, desktop, host]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -116,7 +126,8 @@ jobs:
           add(['windows-x86_64', 'windows-x86_64-nsis'], '_x64-setup.exe')
           add(['darwin-aarch64', 'darwin-aarch64-app'], '_aarch64.app.tar.gz')
           add(['darwin-x86_64', 'darwin-x86_64-app'], '_x64.app.tar.gz')
-          for suffix in ('_android.apk', 'SIGNING-CERTIFICATE.txt', '_aarch64.dmg', '_x64.dmg', '_amd64.deb', '.x86_64.rpm'):
+          for suffix in ('_android.apk', 'SIGNING-CERTIFICATE.txt', '_aarch64.dmg', '_x64.dmg', '_amd64.deb', '.x86_64.rpm',
+                         '_linux-x64.tar.gz', '_linux-arm64.tar.gz', '_darwin-arm64.tar.gz', '_darwin-x64.tar.gz', '_windows-x64.zip'):
               if not one(suffix):
                   raise SystemExit(f'missing *{suffix}')
           manifest = {
@@ -129,6 +140,8 @@ jobs:
           f = lambda suffix: one(suffix)
           notes = f"""AgentsWorld v{version}, construit depuis le commit `{ref[:12]}` de la source.
 
+          Installer en une ligne (Linux, macOS, WSL) : `curl -fsSL https://moukrea.github.io/agentsworld/install.sh | bash` ; Windows (PowerShell) : `irm https://moukrea.github.io/agentsworld/install.ps1 | iex`. Options `--client-only`, `--host`, `--agent` : voir le README.
+
           | Système | Fichier |
           |---|---|
           | Android 8 ou plus (arm64, armv7, x86_64) | `{f('_android.apk')}` |
@@ -136,6 +149,7 @@ jobs:
           | macOS Apple silicon | `{f('_aarch64.dmg')}` |
           | macOS Intel | `{f('_x64.dmg')}` |
           | Windows | `{f('_x64-setup.exe')}` |
+          | Hôte sans écran (installé par `install.sh --host` / `install.ps1 -Host`) | `{f('_linux-x64.tar.gz')}`, `{f('_linux-arm64.tar.gz')}`, `{f('_darwin-arm64.tar.gz')}`, `{f('_darwin-x64.tar.gz')}`, `{f('_windows-x64.zip')}` |
 
           - L'APK est signé par la clé AgentsWorld, certificat SHA-256 `fb19a3dc67e560428c412b1450c19b701d952ce0084d873fb1c0d8724d44e72b` (`SIGNING-CERTIFICATE.txt`).
           - Les applications macOS et Windows ne sont pas signées par un éditeur reconnu : au premier lancement, macOS demande clic droit › Ouvrir (ou Réglages › Confidentialité et sécurité › Ouvrir quand même), Windows SmartScreen « Informations complémentaires › Exécuter quand même ». Leurs mises à jour automatiques sont signées, elles, et vérifiées par l'application (`latest.json`).
@@ -166,3 +180,13 @@ jobs:
             gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
           fi
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url,isDraft,assets --jq '{url, isDraft, assets: [.assets[].name]}'
+  pages:
+    needs: publish
+    if: ${{ !inputs.draft }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml
+    with:
+      release: v${{ inputs.version }}

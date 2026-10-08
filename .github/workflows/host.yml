@@ -1,0 +1,215 @@
+name: Host bundles
+# Runs in the PUBLIC repository moukrea/agentsworld (copied from ops/public/ of the private source by
+# scripts/sync_public_ops.sh, see docs/DEPLOYMENT.md of the source). Builds the headless host runtime archives that
+# install.sh and install.ps1 install for the roles « host » and « agent » (scripts/build-host-bundle.mjs of the source:
+# the official Node 24 binary of each platform, checked against nodejs.org's SHASUMS256.txt, plus the server, CLI and
+# agent bundles and the game), then tests the installers of THIS repository against them on Linux (x64, arm64),
+# macOS (Apple silicon, Intel) and Windows: host on non-default ports, pairing code, agent, update in place,
+# uninstall. One one-day artifact `host-bundles`; release.yml publishes it.
+#
+#   gh workflow run host.yml --repo moukrea/agentsworld -f ref=<source commit>      (build and test only)
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, branch or tag of moukrea/agentsworld-src to build
+        required: true
+        default: main
+      version:
+        description: Version X.Y.Z of the archives (empty = app-desktop/src-tauri/tauri.conf.json)
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      version:
+        description: Release version X.Y.Z, checked against app-desktop/src-tauri/tauri.conf.json (empty = no check)
+        required: false
+        type: string
+        default: ''
+    secrets:
+      SOURCE_READ_KEY:
+        required: true
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ vars.AGENTSWORLD_SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - run: npm ci
+      - name: Version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          app=$(node -p 'require("./app-desktop/src-tauri/tauri.conf.json").version')
+          if [ -n "$VERSION" ] && [ "$VERSION" != "$app" ]; then
+            echo "::error::version $VERSION != $app (app-desktop/src-tauri/tauri.conf.json)"; exit 1
+          fi
+          echo "version=$app" >> "$GITHUB_OUTPUT"
+      - name: Host CLI and desktop tests
+        run: node --test --test-concurrency=1 tests/v3-host-cli.test.mjs tests/v3-desktop.test.mjs
+      - name: Build the archives
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: node scripts/build-host-bundle.mjs --version "$VERSION" --out host-out
+      - name: The linux-x64 archive runs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          rt=$(mktemp -d); data=$(mktemp -d)
+          tar -xzf "host-out/agentsworld-host_${VERSION}_linux-x64.tar.gz" -C "$rt"
+          printf '{"port":14317,"link":{"enabled":true,"port":14318,"relays":[],"mdns":false}}\n' > "$data/config.json"
+          AGENTSWORLD_DATA="$data" "$rt/bin/node" --preserve-symlinks-main "$rt/server/agentsworld-server.mjs" --config "$data/config.json" > "$data/log" 2>&1 &
+          pid=$!
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:14317/api/health >/dev/null 2>&1 && break; sleep 1; done
+          AGENTSWORLD_DATA="$data" "$rt/bin/node" "$rt/cli/agentsworld.mjs" pair --json | grep -q '"code":"aw1\.'
+          curl -fsS http://127.0.0.1:14317/game.html | grep -qi '<canvas\|<script'
+          kill "$pid"
+          ls -l host-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: host-bundles
+          path: host-out/
+          if-no-files-found: error
+          retention-days: 1
+  # The installers of this repository against the archives just built, served from a local mirror
+  # (AGENTSWORLD_DEV_INSTALL=1 allows http://127.0.0.1 only), and the app role against the latest published release.
+  installers:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: .dist
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: host-bundles
+          path: mirror/release
+      - name: Local release mirror
+        run: |
+          set -euo pipefail
+          cd mirror
+          printf '{\n  "version": 1,\n  "release": "v%s",\n  "repository": "moukrea/agentsworld"\n}\n' "$VERSION" > config.json
+          (cd release && { command -v sha256sum >/dev/null && sha256sum -- * || shasum -a 256 -- *; } > SHA256SUMS && cat SHA256SUMS)
+          py=$(command -v python3 || command -v python)
+          "$py" -m http.server 18765 --bind 127.0.0.1 > ../mirror.log 2>&1 &
+          for i in $(seq 1 20); do curl -fsS http://127.0.0.1:18765/config.json >/dev/null 2>&1 && break; sleep 1; done
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y -q shellcheck
+          shellcheck -s bash .dist/install.sh
+      - name: install.sh --host, pair, agent, update, uninstall
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          export AGENTSWORLD_DEV_INSTALL=1 AGENTSWORLD_PAGE_URL=http://127.0.0.1:18765 AGENTSWORLD_RELEASE_BASE=http://127.0.0.1:18765/release
+          export AGENTSWORLD_INSTALLER="$PWD/.dist/install.sh" AGENTSWORLD_NO_LINGER=1
+          cli="$HOME/.local/bin/agentsworld"
+          bash .dist/install.sh --host --port 14317 --link-port 14318 --yes
+          "$cli" status
+          id1=$("$cli" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["link"]["hostId"])')
+          "$cli" pair --json | grep -q '"code":"aw1\.'
+          token=$("$cli" agent-token create CI | grep -o 'ah_agent_[A-Za-z0-9_-]*' | head -n 1)
+          # The agent of another user of this machine: its own HOME, without a service.
+          agent_home=$(mktemp -d)
+          HOME="$agent_home" AGENTSWORLD_NO_SERVICE=1 bash .dist/install.sh --agent --hub http://127.0.0.1:14317 --token "$token" --name CI --yes
+          sleep 8
+          HOME="$agent_home" "$agent_home/.local/bin/agentsworld" status
+          grep -q 'agent' "$agent_home/.local/share/agentsworld/agent.log"
+          # Update in place: same host identity, still serving.
+          "$cli" update
+          id2=$("$cli" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["link"]["hostId"])')
+          [ "$id1" = "$id2" ]
+          HOME="$agent_home" "$agent_home/.local/bin/agentsworld" uninstall --purge
+          "$cli" uninstall --purge
+          sleep 3
+          if curl -fsS http://127.0.0.1:14317/api/health; then echo "::error::the host still answers after uninstall"; exit 1; fi
+          test ! -e "$cli"
+      - name: install.sh --client-only (latest published release)
+        if: runner.os != 'Windows' && matrix.os != 'ubuntu-24.04-arm'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          home=$(mktemp -d)
+          HOME="$home" AGENTSWORLD_VERSION="$tag" AGENTSWORLD_APPS_DIR="$home/Applications" bash .dist/install.sh --client-only --yes
+          if [ "$RUNNER_OS" = macOS ]; then
+            test -x "$home/Applications/AgentsWorld.app/Contents/MacOS/agentsworld"
+            grep -q '"clientOnly": true' "$home/Library/Application Support/io.github.moukrea.agentsworld/desktop.json"
+          else
+            test -x "$home/.local/share/agentsworld/app/AgentsWorld.AppImage"
+            grep -q '"clientOnly": true' "$home/.local/share/io.github.moukrea.agentsworld/desktop.json"
+            grep -q '^Exec=' "$home/.local/share/applications/agentsworld.desktop"
+          fi
+          test ! -e "$home/.local/share/agentsworld/runtime"
+          HOME="$home" "$home/.local/bin/agentsworld" uninstall --purge
+      - name: install.ps1 -Host, pair, update, uninstall
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:AGENTSWORLD_DEV_INSTALL = '1'
+          $env:AGENTSWORLD_PAGE_URL = 'http://127.0.0.1:18765'
+          $env:AGENTSWORLD_RELEASE_BASE = 'http://127.0.0.1:18765/release'
+          $env:AGENTSWORLD_INSTALLER = "$PWD\.dist\install.ps1"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .dist\install.ps1 -Host -Port 14317 -LinkPort 14318 -Yes
+          if ($LASTEXITCODE) { throw "install.ps1 failed ($LASTEXITCODE)" }
+          $cli = Join-Path $env:LOCALAPPDATA 'agentsworld-cli\bin\agentsworld.cmd'
+          & $cli status
+          $pair = & $cli pair --json | Out-String
+          if ($pair -notmatch '"code":"aw1\.') { throw "no pairing code: $pair" }
+          & $cli update
+          if ($LASTEXITCODE) { throw "update failed ($LASTEXITCODE)" }
+          Invoke-WebRequest -UseBasicParsing http://127.0.0.1:14317/api/health | Out-Null
+          & $cli uninstall --purge
+          Start-Sleep -Seconds 3
+          $still = $true; try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:14317/api/health -TimeoutSec 3 | Out-Null } catch { $still = $false }
+          if ($still) { throw 'the host still answers after uninstall' }
+          if (Get-ScheduledTask -TaskName 'AgentsWorld host' -ErrorAction SilentlyContinue) { throw 'the scheduled task is still there' }
+      - name: install.ps1 -ClientOnly (latest published release)
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:AGENTSWORLD_VERSION = (gh release view --repo $env:GITHUB_REPOSITORY --json tagName --jq .tagName)
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .dist\install.ps1 -ClientOnly -Yes
+          if ($LASTEXITCODE) { throw "install.ps1 failed ($LASTEXITCODE)" }
+          if (-not (Test-Path "$env:LOCALAPPDATA\AgentsWorld\agentsworld.exe")) { throw 'the app is not installed' }
+          $desktop = Get-Content "$env:APPDATA\io.github.moukrea.agentsworld\desktop.json" -Raw
+          if ($desktop -notmatch '"clientOnly": true') { throw "desktop.json: $desktop" }
+          & "$env:LOCALAPPDATA\agentsworld-cli\bin\agentsworld.cmd" uninstall --purge

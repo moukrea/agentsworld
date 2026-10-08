@@ -1,0 +1,105 @@
+name: Pages
+# Runs in the PUBLIC repository moukrea/agentsworld (copied from ops/public/ of the private source by
+# scripts/sync_public_ops.sh, see docs/DEPLOYMENT.md of the source). Publishes https://moukrea.github.io/agentsworld/:
+# install.sh and install.ps1 of THIS repository, config.json naming the release they install, SHA256SUMS of those
+# three files, and a page pointing at the README. The release must be published and complete: SHA256SUMS, the
+# five host archives and the desktop apps, each archive checked against SHA256SUMS before the site goes out.
+# release.yml calls it after publishing; by hand:
+#
+#   gh workflow run pages.yml --repo moukrea/agentsworld [-f release=v0.1.2]      (default: the latest release)
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Release tag vX.Y.Z the installers install (empty = the latest published release)
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      release:
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: .dist
+          persist-credentials: false
+      - name: Require a complete published release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE:-$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::invalid release tag $tag"; exit 1; }
+          [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false ] \
+            || { echo "::error::$tag is a draft"; exit 1; }
+          v="${tag#v}"
+          dir="$RUNNER_TEMP/release"; mkdir -p "$dir"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$dir" --pattern SHA256SUMS --pattern 'agentsworld-host_*'
+          cd "$dir"
+          for name in "agentsworld-host_${v}_linux-x64.tar.gz" "agentsworld-host_${v}_linux-arm64.tar.gz" \
+            "agentsworld-host_${v}_darwin-arm64.tar.gz" "agentsworld-host_${v}_darwin-x64.tar.gz" \
+            "agentsworld-host_${v}_windows-x64.zip" "AgentsWorld_${v}_amd64.AppImage" "AgentsWorld_${v}_x64-setup.exe" \
+            "AgentsWorld_${v}_aarch64.app.tar.gz" "AgentsWorld_${v}_x64.app.tar.gz" "AgentsWorld_${v}_amd64.deb" \
+            "AgentsWorld-${v}-1.x86_64.rpm"; do
+            grep -q "  $name\$" SHA256SUMS || { echo "::error::$tag has no $name in SHA256SUMS"; exit 1; }
+          done
+          sha256sum -c SHA256SUMS --ignore-missing
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Site
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir site
+          cp .dist/install.sh .dist/install.ps1 site/
+          printf '{\n  "version": 1,\n  "release": "%s",\n  "repository": "%s"\n}\n' "$TAG" "$GITHUB_REPOSITORY" > site/config.json
+          cat > site/index.html <<HTML
+          <!doctype html>
+          <html lang="fr"><head><meta charset="utf-8"><title>AgentsWorld</title>
+          <meta http-equiv="refresh" content="0; url=https://github.com/$GITHUB_REPOSITORY#installer">
+          </head><body><p><a href="https://github.com/$GITHUB_REPOSITORY#installer">AgentsWorld</a> ($TAG)</p></body></html>
+          HTML
+          (cd site && sha256sum install.sh install.ps1 config.json > SHA256SUMS && cat SHA256SUMS config.json)
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: site
+          retention-days: 1
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        id: deployment
+      - name: The public files are the deployed ones
+        env:
+          PAGE: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS "${PAGE%/}/SHA256SUMS" -o sums && curl -fsS "${PAGE%/}/install.sh" -o install.sh \
+              && curl -fsS "${PAGE%/}/install.ps1" -o install.ps1 && curl -fsS "${PAGE%/}/config.json" -o config.json \
+              && sha256sum -c sums; then cat config.json; exit 0; fi
+            sleep 10
+          done
+          echo "::error::the published site does not match the deployed files"; exit 1

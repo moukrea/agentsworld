@@ -23,6 +23,12 @@ propres appareils, et retire un appareil perdu (Réglages › Appareil › Appar
   intégrée à l'application, manifeste `latest.json` de la dernière release publiée). L'APK est signé par la clé
   AgentsWorld, certificat SHA-256 `fb19a3dc67e560428c412b1450c19b701d952ce0084d873fb1c0d8724d44e72b` ; Android refuse
   une mise à jour signée par une autre clé. Chaque release publie `SHA256SUMS`.
+- **Installateurs** (`install.sh`, `install.ps1`, servis par GitHub Pages depuis ce dépôt) : ils ne téléchargent qu'en
+  HTTPS depuis les releases de ce dépôt et vérifient chaque fichier avec le `SHA256SUMS` de la release avant de
+  remplacer quoi que ce soit ; tout s'installe dans ton dossier personnel, sans droits administrateur (sauf
+  `--format deb|rpm`, qui passe par le gestionnaire de paquets). Le Node de l'hôte sans écran est le binaire officiel
+  de nodejs.org, vérifié avec son `SHASUMS256.txt` au moment de la construction. La page publie aussi le `SHA256SUMS`
+  des deux scripts. `curl … | bash` fait confiance à cette page et à GitHub : lis le script avant si tu préfères.
 
 ## Ce qui n'est pas protégé
 
@@ -37,6 +43,12 @@ propres appareils, et retire un appareil perdu (Réglages › Appareil › Appar
 - Sur l'hôte, les clés et la liste des appareils sont des fichiers 0600 de son dossier de données ; sur Android, les
   clés de l'appareil sont des `CryptoKey` non exportables du WebView. Désinstaller l'application oublie ses appairages.
 - Le relais est un service partagé : il n'est pas un système anti-abus complet et peut être indisponible.
+- L'hôte sans écran (`--host`) sert le jeu en HTTP sur le port 4317 : sur la machine même, tout processus local en
+  est propriétaire (c'est ainsi que `agentsworld pair` crée un code). Installé avec Jaunt, il n'écoute que sur
+  127.0.0.1. Sans Jaunt, il écoute sur toutes les interfaces pour que les agents s'y connectent (avec leur jeton) :
+  quelqu'un sur ton réseau peut alors **regarder** le monde (sessions, projets, questions) sans pouvoir y répondre.
+  Sur un réseau qui n'est pas le tien, filtre ce port ou choisis `--bind 127.0.0.1`. Les appareils, eux, passent
+  toujours par AgentsWorld Link (port 4318, appairés et chiffrés).
 
 ## Signaler une vulnérabilité
 
