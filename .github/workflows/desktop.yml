@@ -87,7 +87,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf rpm libssl-dev libfuse2
+          sudo apt-get install -y -q libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf rpm libssl-dev libfuse2 \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pulseaudio gstreamer1.0-alsa
+      # The GStreamer plugins the AppImage bundles (microphone capture and WebAudio in WebKitGTK; bundleMediaFramework).
+      - name: GStreamer plugins for the AppImage
+        if: runner.os == 'Linux'
+        run: app-desktop/scripts/gstreamer-plugins.sh "$RUNNER_TEMP/gstreamer-plugins" >> "$GITHUB_ENV"
       - name: Desktop tests
         run: node --test --test-concurrency=1 tests/v3-desktop.test.mjs tests/v3-link-crypto.test.mjs tests/v3-link-e2e.test.mjs
       - name: Shell unit tests
