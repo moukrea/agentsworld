@@ -100,6 +100,8 @@ jobs:
         run: |
           node app-desktop/scripts/prepare.mjs
           cargo test --manifest-path app-desktop/src-tauri/Cargo.toml
+          cargo test --manifest-path app-shared/ui-cache/Cargo.toml --features tauri
+          node --test tests/v3-ui-bundle.test.mjs
       - name: Build
         working-directory: app-desktop
         env:
