@@ -262,8 +262,9 @@ exit `$p.ExitCode
     New-Item -ItemType Junction -Path $Rt -Target $target | Out-Null
   }
   # The host answers /api/health with protocol 3 and, when given, this version.
-  function Wait-Host($port, $version = '', $seconds = 60) {
-    for ($i = 0; $i -lt $seconds; $i++) {
+  function Wait-Host($port, $version = '', $seconds = 90) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
       try {
         $h = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 2
         if ($h.protocol -eq 3 -and (-not $version -or $h.version -eq $version)) { return $true }
@@ -336,14 +337,15 @@ const free = (p) => new Promise((resolve) => {
     $http, $link = ([string]$ports).Trim() -split ' '
     Start-Role 'host'
     $script:HostPort = $http
-    if (-not (Wait-Host $http $V 60)) {
-      if ($script:Service -eq 'task') {
-        # A task that cannot run now (no interactive logon, e.g. a CI runner) starts at the next logon: run it now.
-        Warn 'La tache planifiee ne demarre pas maintenant : demarrage direct en arriere-plan (la tache prendra le relais a la prochaine ouverture de session).'
-        Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $Prefix 'host-run.ps1')`"" -WindowStyle Hidden | Out-Null
-      }
-      if (-not (Wait-Host $http $V 60)) { Rollback 'host' "La version $V de l'hote ne repond pas sur le port $http (/api/health, protocole 3)" }
+    $ready = Wait-Host $http $V $(if ($script:PrevRt) { 90 } else { 45 })
+    if (-not $ready -and $script:Service -eq 'task' -and -not $script:PrevRt) {
+      # A first install whose task cannot run now (no interactive logon, e.g. a CI runner): run it directly; the task
+      # starts it at the next logon. An update does not get here: its task ran before.
+      Warn 'La tache planifiee ne demarre pas maintenant : demarrage direct en arriere-plan (la tache prendra le relais a la prochaine ouverture de session).'
+      Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $Prefix 'host-run.ps1')`"" -WindowStyle Hidden | Out-Null
+      $ready = Wait-Host $http $V 60
     }
+    if (-not $ready) { Rollback 'host' "La version $V de l'hote ne repond pas sur le port $http (/api/health, protocole 3)" }
     Info "Hote en marche : http://127.0.0.1:$http (appareils : port Link $link)."
   }
   function Install-Agent {
