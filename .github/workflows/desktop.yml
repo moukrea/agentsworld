@@ -1,0 +1,152 @@
+name: Desktop app
+# Runs in the PUBLIC repository moukrea/agentsworld (copied from ops/public/ of the private source by
+# scripts/sync_public_ops.sh; the same split as Jaunt, see docs/DEPLOYMENT.md of the source). Builds the Tauri desktop
+# app (app-desktop/) from the private source moukrea/agentsworld-src on Linux (AppImage, deb, rpm), macOS (Apple
+# silicon and Intel: app, dmg) and Windows (NSIS), with the updater artifacts signed by the updater key of the
+# environment `release` (main only). Each build uploads one one-day artifact `desktop-<platform>`; release.yml
+# publishes them with the updater manifest `latest.json`.
+#
+#   gh workflow run desktop.yml --repo moukrea/agentsworld -f ref=<source commit>      (build only)
+#
+# macOS and Windows builds are not code-signed unless the optional APPLE_* secrets exist (macOS is then ad hoc
+# signed: right click › Open, or System Settings › Privacy & Security › Open Anyway, the first time; Windows
+# SmartScreen asks once). The updater artifacts are always signed: the apps refuse an update without that signature.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, branch or tag of moukrea/agentsworld-src to build
+        required: true
+        default: main
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      version:
+        description: Release version X.Y.Z, checked against app-desktop/src-tauri/tauri.conf.json (empty = no check)
+        required: false
+        type: string
+        default: ''
+    secrets:
+      SOURCE_READ_KEY:
+        required: true
+permissions: {}
+env:
+  TAURI_CLI: '@tauri-apps/cli@2.12.1'
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported glibc for the AppImage; webkit2gtk-4.1 is available from 22.04.
+          - os: ubuntu-22.04
+            platform: linux-x64
+            bundles: appimage,deb,rpm
+          - os: macos-latest
+            platform: macos-arm64
+            bundles: app,dmg
+          # The last Intel macOS image.
+          - os: macos-15-intel
+            platform: macos-x64
+            bundles: app,dmg
+          - os: windows-latest
+            platform: windows-x64
+            bundles: nsis
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    environment: release
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ vars.AGENTSWORLD_SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Version matches the app
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: node -e 'const v=require("./app-desktop/src-tauri/tauri.conf.json").version;if(process.env.VERSION!==v)throw Error(`version ${process.env.VERSION} != ${v} (app-desktop/src-tauri/tauri.conf.json)`)'
+      # The Node runtime of this job is the one shipped as the sidecar (app-desktop/scripts/prepare.mjs copies it).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: npm ci
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf rpm libssl-dev libfuse2
+      - name: Desktop tests
+        run: node --test --test-concurrency=1 tests/v3-desktop.test.mjs tests/v3-link-crypto.test.mjs tests/v3-link-e2e.test.mjs
+      - name: Shell unit tests
+        if: runner.os == 'Linux'
+        run: |
+          node app-desktop/scripts/prepare.mjs
+          cargo test --manifest-path app-desktop/src-tauri/Cargo.toml
+      - name: Build
+        working-directory: app-desktop
+        env:
+          BUNDLES: ${{ matrix.bundles }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Optional macOS signing and notarization.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY" || { echo "::error::the release environment lacks TAURI_SIGNING_PRIVATE_KEY"; exit 1; }
+          # An empty variable is not an absent one for the bundler: drop the Apple ones that are not set.
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!name:-}" ] || unset "$name"
+          done
+          if [ "$RUNNER_OS" = macOS ] && [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            export APPLE_SIGNING_IDENTITY=-   # ad hoc signature: unsigned for Gatekeeper, but a valid bundle
+          fi
+          npx --yes "$TAURI_CLI" build --ci --bundles "$BUNDLES"
+      - name: Collect the bundles
+        working-directory: app-desktop
+        run: |
+          set -euo pipefail
+          version=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          bundle=src-tauri/target/release/bundle
+          out="$GITHUB_WORKSPACE/desktop-out"
+          mkdir -p "$out"
+          case "$RUNNER_OS" in
+            Linux)
+              cp "$bundle"/appimage/*.AppImage "$bundle"/appimage/*.AppImage.sig "$bundle"/deb/*.deb "$bundle"/rpm/*.rpm "$out"/
+              cp "$bundle"/deb/*.deb.sig "$bundle"/rpm/*.rpm.sig "$out"/ 2>/dev/null || true
+              ;;
+            macOS)
+              case "$(uname -m)" in arm64) arch=aarch64 ;; x86_64) arch=x64 ;; *) echo "::error::unknown arch"; exit 1 ;; esac
+              cp "$bundle"/dmg/*.dmg "$out"/
+              # The updater archive is named after the app only: give it the version and the architecture.
+              cp "$bundle"/macos/AgentsWorld.app.tar.gz "$out/AgentsWorld_${version}_${arch}.app.tar.gz"
+              cp "$bundle"/macos/AgentsWorld.app.tar.gz.sig "$out/AgentsWorld_${version}_${arch}.app.tar.gz.sig"
+              ;;
+            Windows)
+              cp "$bundle"/nsis/*-setup.exe "$bundle"/nsis/*-setup.exe.sig "$out"/
+              ;;
+          esac
+          ls -l "$out"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: desktop-out/
+          if-no-files-found: error
+          retention-days: 1

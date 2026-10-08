@@ -1,0 +1,166 @@
+name: Release
+# Runs in the PUBLIC repository moukrea/agentsworld (copied from ops/public/ of the private source by
+# scripts/sync_public_ops.sh, see docs/DEPLOYMENT.md of the source). Builds one commit of the private source: the
+# Android APK (android.yml) and the desktop apps (desktop.yml), then publishes them as ONE release vX.Y.Z of this
+# repository with SHA256SUMS and the desktop updater manifest latest.json. The installed desktop apps read
+# https://github.com/moukrea/agentsworld/releases/latest/download/latest.json (app-desktop/src-tauri/tauri.conf.json):
+# publishing makes the update available at once; `draft: true` keeps it as a draft to check first.
+#
+#   gh workflow run release.yml --repo moukrea/agentsworld -f ref=$(git rev-parse HEAD) -f version=0.1.0
+#
+# The version must equal both tauri.conf.json `version`s at that commit. A published release is never replaced; a
+# draft of the same version (a previous attempt) is.
+run-name: Release v${{ inputs.version }} (${{ inputs.ref }})
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source commit (40 hexadecimal characters) of moukrea/agentsworld-src
+        required: true
+        type: string
+      version:
+        description: Version X.Y.Z (the release is vX.Y.Z)
+        required: true
+        type: string
+      draft:
+        description: Keep the release as a draft instead of publishing it
+        required: false
+        type: boolean
+        default: false
+permissions: {}
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require an exact commit, a version and no published release of it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full source commit (40 lowercase hexadecimal characters)"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be X.Y.Z"; exit 1; }
+          if draft=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) && [ "$draft" != true ]; then
+            echo "::error::v$VERSION is already published: releases are never replaced"
+            exit 1
+          fi
+  android:
+    needs: guard
+    permissions:
+      contents: read
+    uses: ./.github/workflows/android.yml
+    with:
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version }}
+    secrets:
+      SOURCE_READ_KEY: ${{ secrets.SOURCE_READ_KEY }}
+  desktop:
+    needs: guard
+    permissions:
+      contents: read
+    uses: ./.github/workflows/desktop.yml
+    with:
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version }}
+    secrets:
+      SOURCE_READ_KEY: ${{ secrets.SOURCE_READ_KEY }}
+  publish:
+    needs: [android, desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: release
+          merge-multiple: true
+      - name: Updater manifest, notes and checksums
+        env:
+          REF: ${{ inputs.ref }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, urllib.parse
+          release = pathlib.Path('release')
+          version, ref, repo = os.environ['VERSION'], os.environ['REF'], os.environ['GITHUB_REPOSITORY']
+          base = f'https://github.com/{repo}/releases/download/v{version}/'
+          names = sorted(p.name for p in release.iterdir() if p.is_file())
+          def one(suffix):
+              found = [n for n in names if n.endswith(suffix)]
+              if len(found) > 1:
+                  raise SystemExit(f'more than one *{suffix}: {found}')
+              return found[0] if found else None
+          platforms = {}
+          def add(keys, suffix, required=True):
+              name = one(suffix)
+              if not name or f'{name}.sig' not in names:
+                  if required:
+                      raise SystemExit(f'missing *{suffix} or its updater signature (.sig)')
+                  return
+              entry = {'signature': (release / f'{name}.sig').read_text().strip(), 'url': base + urllib.parse.quote(name)}
+              for key in keys:
+                  platforms[key] = entry
+          # The updater serves the AppImage, the macOS app and the NSIS installer (app-desktop/README.md « Limits »):
+          # .deb and .rpm installs update through new packages.
+          add(['linux-x86_64', 'linux-x86_64-appimage'], '_amd64.AppImage')
+          add(['windows-x86_64', 'windows-x86_64-nsis'], '_x64-setup.exe')
+          add(['darwin-aarch64', 'darwin-aarch64-app'], '_aarch64.app.tar.gz')
+          add(['darwin-x86_64', 'darwin-x86_64-app'], '_x64.app.tar.gz')
+          for suffix in ('_android.apk', 'SIGNING-CERTIFICATE.txt', '_aarch64.dmg', '_x64.dmg', '_amd64.deb', '.x86_64.rpm'):
+              if not one(suffix):
+                  raise SystemExit(f'missing *{suffix}')
+          manifest = {
+              'version': version,
+              'notes': f'AgentsWorld {version}',
+              'pub_date': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'platforms': platforms,
+          }
+          (release / 'latest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          f = lambda suffix: one(suffix)
+          notes = f"""AgentsWorld v{version}, construit depuis le commit `{ref[:12]}` de la source.
+
+          | Système | Fichier |
+          |---|---|
+          | Android 8 ou plus (arm64, armv7, x86_64) | `{f('_android.apk')}` |
+          | Linux | `{f('_amd64.AppImage')}` (se met à jour seul), `{f('_amd64.deb')}` ou `{f('.x86_64.rpm')}` |
+          | macOS Apple silicon | `{f('_aarch64.dmg')}` |
+          | macOS Intel | `{f('_x64.dmg')}` |
+          | Windows | `{f('_x64-setup.exe')}` |
+
+          - L'APK est signé par la clé AgentsWorld, certificat SHA-256 `fb19a3dc67e560428c412b1450c19b701d952ce0084d873fb1c0d8724d44e72b` (`SIGNING-CERTIFICATE.txt`).
+          - Les applications macOS et Windows ne sont pas signées par un éditeur reconnu : au premier lancement, macOS demande clic droit › Ouvrir (ou Réglages › Confidentialité et sécurité › Ouvrir quand même), Windows SmartScreen « Informations complémentaires › Exécuter quand même ». Leurs mises à jour automatiques sont signées, elles, et vérifiées par l'application (`latest.json`).
+          - Vérifier un téléchargement : `sha256sum -c SHA256SUMS --ignore-missing`.
+          """
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'notes.md').write_text('\n'.join(line.removeprefix('          ') for line in notes.splitlines()) + '\n')
+          PY
+          cd release
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          ls -l
+          cat latest.json
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            [ "$draft" = true ] || { echo "::error::$tag is already published: releases are never replaced"; exit 1; }
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "$tag" release/* --repo "$GITHUB_REPOSITORY" --draft --target main \
+            --title "AgentsWorld $tag" --notes-file "$RUNNER_TEMP/notes.md"
+          if [ "$DRAFT" != true ]; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url,isDraft,assets --jq '{url, isDraft, assets: [.assets[].name]}'
